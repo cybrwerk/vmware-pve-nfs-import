@@ -1,2 +1,12 @@
-# vmware-pve-nfs-import
-A python script to automate import of vmware VM into Proxmox over a common used NFS Share
+# NFS Import and Migration Tool
+
+## Purpose
+- Intended to driectly Import and Create vmware VM from a NFS Store to Proxmox Cluster
+
+## Installation
+
+
+## Migration Procedure
+
+
+## Usage
