@@ -18,6 +18,7 @@ The script is intended to run on a Proxmox host and requires:
 - Proxmox commands available on the host:
   - `qm`
   - `pvesm`
+- The local Storage of Proxmox must be set to support Type `disk-image`
 - Python 3 with the following packages:
   - `rich`
   - `questionary`
