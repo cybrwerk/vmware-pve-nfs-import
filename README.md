@@ -1,4 +1,4 @@
-# Datimo IT Solution - VMware NFS Import and Migration Tool
+# Datimo IT Solutions - VMware NFS Import and Migration Tool
 
 This repository contains the helper script [pve_nfs_vmware_import.py](pve_nfs_vmware_import.py) to import VMware virtual machines whose VMDK files are stored on an NFS share into Proxmox VE. The workflow is designed for a migration path where the VM is first brought up from the NFS-backed disks in Proxmox, then the disks can be moved to the final target storage.
 
