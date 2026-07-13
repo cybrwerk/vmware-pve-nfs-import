@@ -100,7 +100,7 @@ Follow this sequence carefully:
    - This moves the imported disks from the temporary NFS-backed representation to the intended Proxmox storage backend
 
 ## Need Help
-![Datimo IT Solution logo](./datimo-logo.png)
+![Datimo IT Solution logo](./datimo-logo.png)  
 If you need assistance with the migration process, the import script, or the Proxmox setup, please visit our website: [Datimo IT Solution](https://www.datimo.ch) or contact the Datimo IT Solution team / the responsible administrator for this environment.
 
 ## Notes
