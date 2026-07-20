@@ -107,6 +107,7 @@ class VMwareDisk:
     descriptor_path: Path
     flat_path: Path
     proxmox_bus: str
+    size_bytes: Optional[int] = None
 
 
 @dataclass
@@ -284,6 +285,200 @@ def run(
 
     return result
 
+def render_move_disk_command(vmid: int, disk: str, target_storage: str) -> list[str]:
+    """
+    Baut den bevorzugten qm-disk-move-Befehl.
+
+    Fuer den tmux-Job verwenden wir die moderne Syntax.
+    Falls du alte Proxmox-Versionen unterstuetzen willst, kann das Script
+    im Shell-Job noch auf qm move_disk fallbacken.
+    """
+    return [
+        "qm", "disk", "move",
+        str(vmid),
+        disk,
+        target_storage,
+        "--delete", "1",
+    ]
+
+
+def build_disk_migration_script(plans: list[ImportPlan]) -> Path:
+    """
+    Erstellt ein Shell-Script, das alle Disk-Migrationen sequenziell ausfuehrt.
+    """
+    RUNTIME.log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    script_path = RUNTIME.log_dir / f"disk-migration-{timestamp}.sh"
+    job_log = RUNTIME.log_dir / f"disk-migration-{timestamp}.log"
+
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        f'LOG_FILE="{job_log}"',
+        'exec > >(tee -a "$LOG_FILE") 2>&1',
+        "",
+        'echo "Disk migration started: $(date -Is)"',
+        "",
+    ]
+
+    for plan in plans:
+        for disk in plan.vm.disks:
+            modern_cmd = render_move_disk_command(
+                plan.vmid,
+                disk.proxmox_bus,
+                plan.target_storage,
+            )
+
+            fallback_cmd = [
+                "qm", "move_disk",
+                str(plan.vmid),
+                disk.proxmox_bus,
+                plan.target_storage,
+                "--delete", "1",
+            ]
+
+            lines.extend([
+                f'echo ""',
+                f'echo "Migrating VM {plan.vm.name} ({plan.vmid}) disk {disk.proxmox_bus} to {plan.target_storage}: $(date -Is)"',
+                f'if {" ".join(shlex.quote(part) for part in modern_cmd)}; then',
+                f'  echo "OK: VM {plan.vmid} {disk.proxmox_bus}"',
+                "else",
+                f'  echo "Modern qm disk move failed, trying fallback qm move_disk for VM {plan.vmid} {disk.proxmox_bus}"',
+                f'  {" ".join(shlex.quote(part) for part in fallback_cmd)}',
+                "fi",
+                f'echo "Finished VM {plan.vmid} disk {disk.proxmox_bus}: $(date -Is)"',
+                "",
+            ])
+
+    lines.extend([
+        'echo ""',
+        'echo "Disk migration finished: $(date -Is)"',
+        "",
+    ])
+
+    script_path.write_text("\n".join(lines))
+    script_path.chmod(0o750)
+
+    LOG.info("Disk-Migration-Script geschrieben: %s", script_path)
+    LOG.info("Disk-Migration-Log: %s", job_log)
+
+    return script_path
+
+
+def start_disk_migration_detached(plans: list[ImportPlan]) -> None:
+    """
+    Startet die Disk-Migration detached.
+
+    Prioritaet:
+    - tmux
+    - screen
+    - systemd-run
+    """
+    if RUNTIME.dry_run:
+        runner = get_detach_runner() or "kein detached runner gefunden"
+        console.print(
+            f"[cyan]DRY-RUN:[/cyan] Wuerde Disk-Migration detached starten "
+            f"ueber: {runner}"
+        )
+        return
+
+    runner = get_detach_runner()
+    if not runner:
+        console.print(
+            "[red]Kein Tool fuer detached Jobs gefunden.[/red]\n"
+            "Bitte installiere eines davon:\n"
+            "  apt install tmux\n"
+            "  apt install screen\n\n"
+            "Alternative ohne interaktive Session:\n"
+            "  systemd-run ist normalerweise Teil von systemd."
+        )
+        return
+
+    script_path = build_disk_migration_script(plans)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    job_name = f"pve-migrate-{timestamp}"
+
+    if runner == "tmux":
+        run([
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            job_name,
+            str(script_path),
+        ])
+
+        console.print(Panel.fit(
+            "[bold green]Disk-Migration detached gestartet[/bold green]\n\n"
+            f"Runner: tmux\n"
+            f"Session: {job_name}\n"
+            f"Script: {script_path}\n\n"
+            f"Anzeigen:\n"
+            f"  tmux attach -t {job_name}\n\n"
+            f"Detach aus tmux:\n"
+            f"  CTRL-b danach d"
+        ))
+        return
+
+    if runner == "screen":
+        run([
+            "screen",
+            "-dmS",
+            job_name,
+            str(script_path),
+        ])
+
+        console.print(Panel.fit(
+            "[bold green]Disk-Migration detached gestartet[/bold green]\n\n"
+            f"Runner: screen\n"
+            f"Session: {job_name}\n"
+            f"Script: {script_path}\n\n"
+            f"Anzeigen:\n"
+            f"  screen -r {job_name}\n\n"
+            f"Detach aus screen:\n"
+            f"  CTRL-a danach d"
+        ))
+        return
+
+    if runner == "systemd-run":
+        run([
+            "systemd-run",
+            "--unit", job_name,
+            "--description", "Proxmox VM disk migration",
+            "--collect",
+            str(script_path),
+        ])
+
+        console.print(Panel.fit(
+            "[bold green]Disk-Migration als systemd transient unit gestartet[/bold green]\n\n"
+            f"Runner: systemd-run\n"
+            f"Unit: {job_name}.service\n"
+            f"Script: {script_path}\n\n"
+            f"Status:\n"
+            f"  systemctl status {job_name}.service\n\n"
+            f"Logs:\n"
+            f"  journalctl -u {job_name}.service -f"
+        ))
+        return
+
+def get_detach_runner() -> Optional[str]:
+    """
+    Ermittelt das beste verfuegbare Tool fuer detached Jobs.
+
+    Prioritaet:
+    1. tmux      - interaktiv wieder anhaengbar
+    2. screen    - interaktiv wieder anhaengbar
+    3. systemd-run - sauberer systemd Job, aber nicht interaktiv
+    """
+    for command in ["tmux", "screen", "systemd-run"]:
+        if command_exists(command):
+            return command
+
+    return None
+
+
 
 # -----------------------------------------------------------------------------
 # VMX / VMDK Parsing
@@ -431,10 +626,64 @@ def discover_vms(nfs_root: Path) -> list[Path]:
     LOG.info("Suche VMX-Dateien unter: %s", nfs_root)
     return sorted(nfs_root.rglob("*.vmx"))
 
+def disk_sort_key(file_name: str) -> tuple[int, int, str]:
+    """
+    Sortiert VMware-VMDKs so, dass die Basisdisk ohne Nummer zuerst kommt.
+
+    Beispiele:
+      RTS-Mig-Test.vmdk      -> zuerst
+      RTS-Mig-Test_1.vmdk
+      RTS-Mig-Test_2.vmdk
+      RTS-Mig-Test_10.vmdk   -> nach _2
+    """
+    name = Path(file_name).name
+    stem = Path(file_name).stem
+
+    match = re.search(r"_(\d+)$", stem)
+    if match:
+        return (1, int(match.group(1)), name.lower())
+
+    return (0, 0, name.lower())
+
+def assign_default_scsi_ports(disks: list[VMwareDisk]) -> None:
+    """
+    Weist nach der sortierten Reihenfolge Default-SCSI-Ports zu.
+    Die niedrigste bzw. Basis-VMDK landet dadurch auf scsi0.
+    """
+    for index, disk in enumerate(sorted(disks, key=lambda d: disk_sort_key(d.file_name))):
+        disk.proxmox_bus = f"scsi{index}"
+
+def get_file_size(path: Path) -> Optional[int]:
+    try:
+        return path.stat().st_size
+    except OSError as exc:
+        LOG.warning("Dateigroesse konnte nicht gelesen werden: %s: %s", path, exc)
+        return None
+
+def format_size(size_bytes: Optional[int]) -> str:
+    """
+    Formatiert Bytes als gut lesbare GB/TB-Anzeige.
+
+    Verwendet binaere Einheiten:
+    - GB = GiB
+    - TB = TiB
+
+    Die Anzeige bleibt bewusst als GB/TB beschriftet, weil das fuer
+    Migrations-Reviews praxisnaeher lesbar ist.
+    """
+    if size_bytes is None:
+        return "-"
+
+    gib = size_bytes / (1024 ** 3)
+
+    if gib >= 1024:
+        tib = gib / 1024
+        return f"{tib:.2f} TB"
+
+    return f"{gib:.1f} GB"
 
 def extract_disks(data: dict[str, str], vmx_path: Path) -> list[VMwareDisk]:
     disks: list[VMwareDisk] = []
-    disk_index = 0
 
     for key, file_name in sorted(data.items()):
         match = DISK_KEY_RE.match(key)
@@ -463,19 +712,74 @@ def extract_disks(data: dict[str, str], vmx_path: Path) -> list[VMwareDisk]:
             LOG.warning("Flat-VMDK nicht gefunden: %s", flat_path)
             continue
 
-        proxmox_bus = f"scsi{disk_index}"
-        disk_index += 1
-
         disks.append(VMwareDisk(
             vmware_key=key,
             file_name=file_name,
             descriptor_path=descriptor_path,
             flat_path=flat_path,
-            proxmox_bus=proxmox_bus,
+            proxmox_bus="",
+            size_bytes=get_file_size(flat_path),
         ))
 
-    return disks
+    assign_default_scsi_ports(disks)
+    return sorted(disks, key=lambda d: int(d.proxmox_bus.replace("scsi", "")))
 
+def ask_scsi_port_for_disk(
+    vm_name: str,
+    disk: VMwareDisk,
+    used_ports: set[str],
+) -> str:
+    """
+    Fragt den gewünschten Proxmox-SCSI-Port fuer eine VMware-Disk ab.
+    """
+    choices = []
+    for index in range(0, 32):
+        port = f"scsi{index}"
+        if port in used_ports and port != disk.proxmox_bus:
+            continue
+
+        title = port
+        if port == disk.proxmox_bus:
+            title += " (Default)"
+
+        choices.append(questionary.Choice(title=title, value=port))
+
+    value = questionary.select(
+        (
+            f"{vm_name}: SCSI-Port fuer {disk.descriptor_path.name} "
+            f"[{format_size(disk.size_bytes)}] "
+            f"({disk.vmware_key}, flat={disk.flat_path.name}):"
+        ),
+        choices=choices,
+        default=disk.proxmox_bus or "scsi0",
+    ).ask()
+
+    if value is None:
+        raise KeyboardInterrupt
+
+    return str(value)
+
+def ask_disk_scsi_mapping(vm: VMwareVM) -> None:
+    """
+    Laesst den Benutzer alle importierten VMDKs auf Proxmox-SCSI-Ports mappen.
+    """
+    if not vm.disks:
+        return
+
+    console.print(Panel.fit(
+        f"[bold]Disk/SCSI-Mapping:[/bold] {vm.name}\n\n"
+        "Die Basis-VMDK ohne Nummer wird standardmaessig auf scsi0 gelegt.\n"
+        "Du kannst die Ports hier bei Bedarf anpassen."
+    ))
+
+    used_ports: set[str] = set()
+
+    for disk in sorted(vm.disks, key=lambda d: int(d.proxmox_bus.replace("scsi", ""))):
+        selected_port = ask_scsi_port_for_disk(vm.name, disk, used_ports)
+        disk.proxmox_bus = selected_port
+        used_ports.add(selected_port)
+
+    vm.disks.sort(key=lambda d: int(d.proxmox_bus.replace("scsi", "")))
 
 def extract_nics(data: dict[str, str]) -> list[VMwareNic]:
     """
@@ -835,6 +1139,8 @@ def collect_vm_wizard_values(
     ).ask()
     if target_storage is None:
         raise KeyboardInterrupt
+    
+    ask_disk_scsi_mapping(vm)
 
     if not vm.nics:
         console.print(
@@ -858,8 +1164,9 @@ def collect_vm_wizard_values(
         choices = [
             questionary.Choice(
                 title=(
-                    f"{disk.proxmox_bus} | {disk.vmware_key} | "
-                    f"{disk.descriptor_path.name} | flat={disk.flat_path.name}"
+                    f"{disk.proxmox_bus} | {disk.descriptor_path.name} | "
+                    f"{format_size(disk.size_bytes)} | {disk.vmware_key} | "
+                    f"flat={disk.flat_path.name}"
                 ),
                 value=disk.proxmox_bus,
             )
@@ -963,8 +1270,8 @@ def show_single_plan_review(plan: ImportPlan) -> None:
     if vm.disks:
         for disk in vm.disks:
             lines.append(
-                f"- {disk.proxmox_bus}: {disk.vmware_key} | "
-                f"{disk.descriptor_path.name} -> {disk.flat_path}"
+                f"- {disk.proxmox_bus}: {format_size(disk.size_bytes)} | "
+                f"{disk.vmware_key} | {disk.descriptor_path.name} -> {disk.flat_path}"
             )
     else:
         lines.append("- keine Disks erkannt")
@@ -1039,6 +1346,7 @@ def show_disk_plan(plans: list[ImportPlan]) -> None:
     table.add_column("VM")
     table.add_column("VMID")
     table.add_column("Bus")
+    table.add_column("Groesse")
     table.add_column("VMware Descriptor")
     table.add_column("Flat VMDK")
     table.add_column("Lokaler Descriptor")
@@ -1050,6 +1358,7 @@ def show_disk_plan(plans: list[ImportPlan]) -> None:
                 plan.vm.name,
                 str(plan.vmid),
                 disk.proxmox_bus,
+                format_size(disk.size_bytes),
                 str(disk.descriptor_path),
                 str(disk.flat_path),
                 str(local_descriptor),
@@ -1343,6 +1652,8 @@ def plan_to_dict(plan: ImportPlan) -> dict:
                 "bus": disk.proxmox_bus,
                 "descriptor": str(disk.descriptor_path),
                 "flat": str(disk.flat_path),
+                "size_bytes": disk.size_bytes,
+                "size_human": format_size(disk.size_bytes),
                 "local_descriptor": str(get_local_descriptor_path(plan, disk)),
             }
             for disk in plan.vm.disks
@@ -1502,6 +1813,11 @@ def main() -> None:
 
     require_root()
     require_commands(["qm", "pvesm"])
+    runner = get_detach_runner()
+    if runner:
+        LOG.info("Detached Migration Runner erkannt: %s", runner)
+    else:
+        LOG.warning("Kein detached Migration Runner gefunden")
 
     title = "VMware NFS Importer fuer Proxmox VE"
     if RUNTIME.dry_run:
@@ -1569,7 +1885,7 @@ def main() -> None:
     show_disk_plan(plans)
     show_nic_plan(plans)
 
-    confirm_or_abort("Plan so übernehmen?", default=False)
+    confirm_or_abort("Plan so übernehmen und VM erstellen?", default=False)
 
     state_file = save_state(plans)
     console.print(f"[green]State gespeichert:[/green] {state_file}")
@@ -1580,25 +1896,6 @@ def main() -> None:
             "Es werden keine Proxmox-VMs erstellt, keine Descriptoren geschrieben, "
             "keine VMs gestartet und keine Disks migriert."
         ))
-
-    if not RUNTIME.dry_run:
-        console.print(Panel.fit(
-            "[bold red]STOPP[/bold red]\n\n"
-            "Die ausgewählten VMs müssen jetzt in VMware ESXi/vCenter sauber heruntergefahren sein.\n\n"
-            "Bitte prüfen:\n"
-            "- VM ist ausgeschaltet\n"
-            "- keine aktiven Snapshots\n"
-            "- keine Schreibzugriffe auf die VMDK\n"
-            "- BitLocker Recovery Keys sind gesichert\n"
-        ))
-
-        if not RUNTIME.auto_yes:
-            shutdown_confirmed = questionary.text(
-                "Zum Fortfahren bitte exakt 'ja' eingeben:",
-            ).ask()
-            if shutdown_confirmed != "ja":
-                console.print("[yellow]Abgebrochen.[/yellow]")
-                sys.exit(0)
 
     for plan in plans:
         create_pve_vm(plan)
@@ -1613,18 +1910,37 @@ def main() -> None:
         LOG.info("Fertig ohne gestartete VMs")
         return
 
-    migrate = False
-    if RUNTIME.auto_yes:
-        migrate = False
-    else:
-        migrate = bool(questionary.confirm(
-            "Jetzt Disk-Migration auf Ziel-Storage starten?",
-            default=False,
-        ).ask())
+    migration_mode = "skip"
 
-    if migrate:
+    detached_runner = get_detach_runner()
+    detached_title = (
+        f"Ja, detached im Hintergrund starten ({detached_runner})"
+        if detached_runner
+        else "Ja, detached im Hintergrund starten (kein Runner gefunden)"
+    )
+
+    if RUNTIME.auto_yes:
+        migration_mode = "skip"
+    else:
+        migration_mode = questionary.select(
+            "Disk-Migration auf Ziel-Storage starten?",
+            choices=[
+                questionary.Choice(title="Nein, jetzt nicht migrieren", value="skip"),
+                questionary.Choice(title="Ja, im Vordergrund ausfuehren", value="foreground"),
+                questionary.Choice(title=detached_title, value="detached"),
+            ],
+            default="skip",
+        ).ask()
+
+        if migration_mode is None:
+            raise KeyboardInterrupt
+
+    if migration_mode == "foreground":
         move_disks_one_by_one(start_approved_plans)
         show_vm_status(start_approved_plans)
+
+    elif migration_mode == "detached":
+        start_disk_migration_detached(start_approved_plans)
 
     console.print("[green]Fertig.[/green]")
     LOG.info("Fertig")
